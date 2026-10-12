@@ -613,7 +613,7 @@ class safe_open:
             
             self.tensor_offsets.extend([(f_idx, v["data_offsets"][0] + tensor_offset) for k, v in ordered_tensor_metadatas] + [(f_idx, ordered_tensor_metadatas[-1][1]["data_offsets"][1] + tensor_offset)])
             for name, metadata in ordered_tensor_metadatas:
-                keep = tensor_filter is None or tensor_filter(name)
+                keep = tensor_filter is None or bool(tensor_filter(name))
                 self.tensor_keep.append(keep)
                 if keep:
                     self.ordered_tensor_metadatas.append((name, metadata))
