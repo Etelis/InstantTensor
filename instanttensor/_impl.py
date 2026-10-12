@@ -9,7 +9,7 @@ import torch.distributed as dist
 import instanttensor._C as _C
 from instanttensor._cpu_count import cpu_count
 from enum import Enum
-from typing import Union, Generator, Optional
+from typing import Union, Generator, Optional, Callable
 import threading
 import atexit
 from collections import defaultdict
@@ -488,6 +488,9 @@ class safe_open:
             views into an internal ring buffer reused during iteration and
             freed on ``__exit__`` — consume each tensor before the next yield
             and do not store references past the ``with`` block.
+        tensor_filter: Optional predicate selecting tensor names before I/O.
+            Excluded tensors do not contribute to buffer sizing or progress.
+            Requires ``process_group=None`` so ranks can select different tensors.
         backend: I/O backend candidate(s) to use. This can be a single
             ``Backend``/``BackendPolicy`` value or a list of them. Supported
             backends are ``Backend.AIO``, ``Backend.AIO_BUFFERED``,
@@ -545,12 +548,16 @@ class safe_open:
     def __init__(self, filename: Union[str, list[str]], framework: str,
             device: Union[int, str, torch.device], process_group=None, *,
             buffer_size: Optional[int]=None, chunk_size: Optional[int]=None, concurrency: Optional[int]=None, io_depth: Optional[int]=None,
-            max_free_mem_usage: Optional[float]=None, load_now: bool = True, copy: bool = True, backend: BackendCandidates = None):
+            max_free_mem_usage: Optional[float]=None, load_now: bool = True, copy: bool = True, backend: BackendCandidates = None,
+            tensor_filter: Optional[Callable[[str], bool]] = None):
         """Initialize the safe_open context manager.
         
         See class docstring for detailed parameter descriptions.
         """ 
         self.init_time = time.perf_counter()
+
+        if tensor_filter is not None and process_group is not None:
+            raise ValueError("tensor_filter requires process_group=None")
 
         if isinstance(filename, str):
             filename = [filename]
@@ -576,6 +583,7 @@ class safe_open:
 
         self.ordered_tensor_metadatas = []
         self.tensor_offsets = []
+        self.tensor_keep = []
         self.iterated = False
         self.tmp_generator = None
         self.copy = copy
@@ -604,7 +612,11 @@ class safe_open:
                 raise ValueError("Safetensors data offsets must be contiguous")
             
             self.tensor_offsets.extend([(f_idx, v["data_offsets"][0] + tensor_offset) for k, v in ordered_tensor_metadatas] + [(f_idx, ordered_tensor_metadatas[-1][1]["data_offsets"][1] + tensor_offset)])
-            self.ordered_tensor_metadatas.extend(ordered_tensor_metadatas)
+            for name, metadata in ordered_tensor_metadatas:
+                keep = tensor_filter is None or tensor_filter(name)
+                self.tensor_keep.append(keep)
+                if keep:
+                    self.ordered_tensor_metadatas.append((name, metadata))
         
 
         self.tensor_name_to_index = {k: i for i, (k, v) in enumerate(self.ordered_tensor_metadatas)}
@@ -814,7 +826,7 @@ class safe_open:
             self.buffer_size = max(buffer_size_for_tensors, buffer_size_for_io)
         else:
             self.buffer_size = buffer_size
-            min_buffer_size = max(self.tensor_sizes)
+            min_buffer_size = max(self.tensor_sizes, default=0)
             if self.buffer_size < min_buffer_size:
                 warnings.warn(
                     f"Enlarge buffer size from {self.buffer_size} to {min_buffer_size} to match the largest tensor size.",
@@ -886,7 +898,7 @@ class safe_open:
         nccl_communicator = self.process_group._get_backend(self.device)._comm_ptr() if self.process_group is not None else 0
         self.loader_handle = _C.open(
             self.filename, self.device_idx, nccl_communicator, self.buffer_size, 
-            self.chunk_size, self.concurrency, self.io_depth, self.backend.value, self.tensor_offsets)
+            self.chunk_size, self.concurrency, self.io_depth, self.backend.value, self.tensor_offsets, self.tensor_keep)
 
     def __enter__(self) -> 'safe_open':
         if self.loader_handle is None:
