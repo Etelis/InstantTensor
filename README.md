@@ -129,15 +129,25 @@ include neighboring bytes required for page alignment.
 
 ```python
 with safe_open(files, framework="pt", device=0,
-               tensor_filter=["model.embed_tokens.weight", r"model\.layers\.0\..*"]) as f:
+               tensor_filter=["model.embed_tokens.weight", "model.layers.0.*"]) as f:
     for name, tensor in f.tensors():
         tensors[name] = tensor
 ```
 
 Filtering requires `process_group=None`: each GPU loads its own selection
 independently. Unfiltered distributed loading is unchanged.
-Checkpoint names are matched literally; other entries are full-match regular
-expressions. `None` selects all tensors and `[]` selects none.
+Use `tensor_name_match_mode` to choose how all entries in the list are interpreted:
+
+| Mode | Example | Matching |
+|---|---|---|
+| `"glob"` (default) | `"model.layers.*.weight"` | Shell-style wildcards (`*`, `?`, `[abc]`); dots are literal. |
+| `"exact"` | `"model.layers.0.weight"` | Literal full names, including any wildcard or regex characters. |
+| `"regex"` | `r"model\.layers\.\d+\.weight"` | Full-match regular expressions (`re.fullmatch`). |
+
+Matching is case-sensitive by default and selects a tensor if any pattern matches its
+whole name; the mode is never inferred from checkpoint contents. In glob mode,
+`*` can span dots, and names containing wildcard characters need escaping or
+`tensor_name_match_mode="exact"`. `None` selects all tensors and `[]` selects none.
 With `copy=False`, consume each tensor inline
 because alignment padding can cause buffer reuse even when tensor bytes fit.
 

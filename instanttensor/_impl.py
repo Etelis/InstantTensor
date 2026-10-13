@@ -3,6 +3,7 @@ import sys
 import time
 import json
 import re
+import fnmatch
 import warnings
 import math
 import torch # must before instanttensor._C
@@ -10,7 +11,7 @@ import torch.distributed as dist
 import instanttensor._C as _C
 from instanttensor._cpu_count import cpu_count
 from enum import Enum
-from typing import Union, Generator, Optional
+from typing import Union, Generator, Optional, Callable, Literal
 import threading
 import atexit
 from collections import defaultdict
@@ -433,6 +434,44 @@ def recommended_buffer_size_for_tensors(tensor_sizes: list[int], overlap_factor:
 
 group_communicator_cache = {}
 
+def _compile_name_matcher(
+    name_patterns: Optional[list[str]],
+    tensor_name_match_mode: Literal["exact", "glob", "regex"] = "glob",
+) -> Callable[[str], bool]:
+    if tensor_name_match_mode not in ("exact", "glob", "regex"):
+        raise ValueError("tensor_name_match_mode must be 'exact', 'glob', or 'regex'")
+    if name_patterns is not None and (
+        not isinstance(name_patterns, list)
+        or any(not isinstance(pattern, str) for pattern in name_patterns)
+    ):
+        raise TypeError("Name patterns must be a list of strings")
+    if name_patterns is None:
+        return lambda name: True
+    if tensor_name_match_mode == "exact":
+        return set(name_patterns).__contains__
+
+    exact_names = set()
+    patterns = []
+    for pattern in name_patterns:
+        # Glob patterns without these metacharacters are literal names.
+        if tensor_name_match_mode == "glob" and not any(char in pattern for char in "*?["):
+            exact_names.add(pattern)
+            continue
+        try:
+            patterns.append(re.compile(
+                fnmatch.translate(pattern) if tensor_name_match_mode == "glob" else pattern
+            ))
+        except re.error as error:
+            raise ValueError(f"Invalid regex pattern {pattern!r}: {error}") from error
+    if not patterns:
+        return exact_names.__contains__
+    if exact_names:
+        return lambda name: name in exact_names or any(
+            pattern.fullmatch(name) is not None for pattern in patterns
+        )
+    return lambda name: any(pattern.fullmatch(name) is not None for pattern in patterns)
+
+
 class safe_open:
     """Context manager for lazily loading safetensors files with high performance.
     
@@ -489,10 +528,15 @@ class safe_open:
             views into an internal ring buffer reused during iteration and
             freed on ``__exit__`` — consume each tensor before the next yield
             and do not store references past the ``with`` block.
-        tensor_filter: Optional list of exact tensor names or full-match regular
-            expressions selecting tensors before I/O. An empty list selects none.
+        tensor_filter: Optional list of name patterns selecting tensors before I/O.
+            Patterns are matched using the rules specified by ``tensor_name_match_mode``.
+            A tensor is selected when any pattern matches. An empty list selects none.
             Excluded tensors do not contribute to buffer sizing or progress.
             Requires ``process_group=None`` so ranks can select different tensors.
+        tensor_name_match_mode: How to match tensor name patterns: ``"glob"``
+            (default) for shell-style wildcards, ``"exact"`` for literal names,
+            or ``"regex"`` for regular expressions. Matching is case-sensitive
+            by default; all modes match the whole tensor name.
         backend: I/O backend candidate(s) to use. This can be a single
             ``Backend``/``BackendPolicy`` value or a list of them. Supported
             backends are ``Backend.AIO``, ``Backend.AIO_BUFFERED``,
@@ -551,7 +595,8 @@ class safe_open:
             device: Union[int, str, torch.device], process_group=None, *,
             buffer_size: Optional[int]=None, chunk_size: Optional[int]=None, concurrency: Optional[int]=None, io_depth: Optional[int]=None,
             max_free_mem_usage: Optional[float]=None, load_now: bool = True, copy: bool = True, backend: BackendCandidates = None,
-            tensor_filter: Optional[list[str]] = None):
+            tensor_filter: Optional[list[str]] = None,
+            tensor_name_match_mode: Literal["exact", "glob", "regex"] = "glob"):
         """Initialize the safe_open context manager.
         
         See class docstring for detailed parameter descriptions.
@@ -560,11 +605,7 @@ class safe_open:
 
         if tensor_filter is not None and process_group is not None:
             raise ValueError("tensor_filter requires process_group=None")
-        if tensor_filter is not None and (
-            not isinstance(tensor_filter, list) or
-            any(not isinstance(pattern, str) for pattern in tensor_filter)
-        ):
-            raise TypeError("tensor_filter must be a list of tensor names or regex strings")
+        matches_tensor = _compile_name_matcher(tensor_filter, tensor_name_match_mode)
 
         if isinstance(filename, str):
             filename = [filename]
@@ -605,10 +646,6 @@ class safe_open:
         self.meta_read_time = time.perf_counter()
 
         meta_read_results = self._read_metadata()
-        all_tensor_names = {name for _, metadata, _ in meta_read_results for name in metadata}
-        exact_names = set(tensor_filter or [])
-        tensor_patterns = [re.compile(pattern) for pattern in tensor_filter or []
-                           if pattern not in all_tensor_names]
 
         self.file_metadata = None
         for f_idx, f in enumerate(self.filename):
@@ -624,10 +661,7 @@ class safe_open:
             
             self.tensor_offsets.extend([(f_idx, v["data_offsets"][0] + tensor_offset) for k, v in ordered_tensor_metadatas] + [(f_idx, ordered_tensor_metadatas[-1][1]["data_offsets"][1] + tensor_offset)])
             for name, metadata in ordered_tensor_metadatas:
-                keep = tensor_filter is None or name in exact_names or any(
-                    pattern.fullmatch(name)
-                    for pattern in tensor_patterns
-                )
+                keep = matches_tensor(name)
                 self.tensor_keep.append(keep)
                 if keep:
                     self.ordered_tensor_metadatas.append((name, metadata))

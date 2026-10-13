@@ -98,7 +98,8 @@ def test_filtered_copy_warning_includes_alignment_padding(small_safetensors, cop
     selected = ["w[0]", "w2", "w4", "w6"]
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        with safe_open(path, "pt", 0, tensor_filter=selected, copy=copy,
+        with safe_open(path, "pt", 0, tensor_filter=selected,
+                       tensor_name_match_mode="exact", copy=copy,
                        chunk_size=4096, io_depth=1, buffer_size=65536) as f:
             assert f.buffer_size >= f.total_tensor_size
             loaded = {}
