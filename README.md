@@ -129,13 +129,17 @@ include neighboring bytes required for page alignment.
 
 ```python
 with safe_open(files, framework="pt", device=0,
-               tensor_filter=lambda name: name in needed_keys) as f:
+               tensor_filter=["model.embed_tokens.weight", r"model\.layers\.0\..*"]) as f:
     for name, tensor in f.tensors():
         tensors[name] = tensor
 ```
 
 Filtering requires `process_group=None`: each GPU loads its own selection
 independently. Unfiltered distributed loading is unchanged.
+Checkpoint names are matched literally; other entries are full-match regular
+expressions. `None` selects all tensors and `[]` selects none.
+With `copy=False`, consume each tensor inline
+because alignment padding can cause buffer reuse even when tensor bytes fit.
 
 ### Buffered I/O
 

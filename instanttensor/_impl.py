@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import re
 import warnings
 import math
 import torch # must before instanttensor._C
@@ -9,7 +10,7 @@ import torch.distributed as dist
 import instanttensor._C as _C
 from instanttensor._cpu_count import cpu_count
 from enum import Enum
-from typing import Union, Generator, Optional, Callable
+from typing import Union, Generator, Optional
 import threading
 import atexit
 from collections import defaultdict
@@ -488,7 +489,8 @@ class safe_open:
             views into an internal ring buffer reused during iteration and
             freed on ``__exit__`` — consume each tensor before the next yield
             and do not store references past the ``with`` block.
-        tensor_filter: Optional predicate selecting tensor names before I/O.
+        tensor_filter: Optional list of exact tensor names or full-match regular
+            expressions selecting tensors before I/O. An empty list selects none.
             Excluded tensors do not contribute to buffer sizing or progress.
             Requires ``process_group=None`` so ranks can select different tensors.
         backend: I/O backend candidate(s) to use. This can be a single
@@ -549,7 +551,7 @@ class safe_open:
             device: Union[int, str, torch.device], process_group=None, *,
             buffer_size: Optional[int]=None, chunk_size: Optional[int]=None, concurrency: Optional[int]=None, io_depth: Optional[int]=None,
             max_free_mem_usage: Optional[float]=None, load_now: bool = True, copy: bool = True, backend: BackendCandidates = None,
-            tensor_filter: Optional[Callable[[str], bool]] = None):
+            tensor_filter: Optional[list[str]] = None):
         """Initialize the safe_open context manager.
         
         See class docstring for detailed parameter descriptions.
@@ -558,6 +560,11 @@ class safe_open:
 
         if tensor_filter is not None and process_group is not None:
             raise ValueError("tensor_filter requires process_group=None")
+        if tensor_filter is not None and (
+            not isinstance(tensor_filter, list) or
+            any(not isinstance(pattern, str) for pattern in tensor_filter)
+        ):
+            raise TypeError("tensor_filter must be a list of tensor names or regex strings")
 
         if isinstance(filename, str):
             filename = [filename]
@@ -598,6 +605,10 @@ class safe_open:
         self.meta_read_time = time.perf_counter()
 
         meta_read_results = self._read_metadata()
+        all_tensor_names = {name for _, metadata, _ in meta_read_results for name in metadata}
+        exact_names = set(tensor_filter or [])
+        tensor_patterns = [re.compile(pattern) for pattern in tensor_filter or []
+                           if pattern not in all_tensor_names]
 
         self.file_metadata = None
         for f_idx, f in enumerate(self.filename):
@@ -613,7 +624,10 @@ class safe_open:
             
             self.tensor_offsets.extend([(f_idx, v["data_offsets"][0] + tensor_offset) for k, v in ordered_tensor_metadatas] + [(f_idx, ordered_tensor_metadatas[-1][1]["data_offsets"][1] + tensor_offset)])
             for name, metadata in ordered_tensor_metadatas:
-                keep = tensor_filter is None or bool(tensor_filter(name))
+                keep = tensor_filter is None or name in exact_names or any(
+                    pattern.fullmatch(name)
+                    for pattern in tensor_patterns
+                )
                 self.tensor_keep.append(keep)
                 if keep:
                     self.ordered_tensor_metadatas.append((name, metadata))
@@ -627,10 +641,11 @@ class safe_open:
 
         self._finalize_buffer_size(config.buffer_size)
 
-        if not self.copy and self.buffer_size < self.total_tensor_size:
+        if not self.copy and (tensor_filter is not None or self.buffer_size < self.total_tensor_size):
             warnings.warn(
-                f"copy=False with buffer_size ({self.buffer_size} B) < "
-                f"total_tensor_size ({self.total_tensor_size} B): earlier "
+                f"copy=False with buffer_size ({self.buffer_size} B) and "
+                f"total_tensor_size ({self.total_tensor_size} B): alignment "
+                f"padding and buffer reuse mean earlier "
                 f"tensors may be overwritten during iteration. This warning "
                 f"can be ignored if tensors are consumed inline; otherwise, "
                 f"use copy=True.",

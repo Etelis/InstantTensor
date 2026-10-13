@@ -72,6 +72,7 @@ class LayoutTest(unittest.TestCase):
 
 def exercise_gpu(backend, ranks):
     import json
+    import re
     import struct
     import warnings
     import torch
@@ -107,14 +108,15 @@ def exercise_gpu(backend, ranks):
                     path = Path(directory) / f"case{case_id}-{file_id}.safetensors"
                     path.write_bytes(struct.pack("<Q", len(header)) + header + payload)
                     paths.append(str(path))
-                for predicate in (None, lambda name: int(name[1:]) % 2 == rank % 2, lambda name: False):
+                selection = [name for name in expected if int(name[1:]) % 2 == rank % 2]
+                for filters in (None, selection, [r"t\d*[02468]"], []):
                     selected = {name: tensor for name, tensor in expected.items()
-                                if predicate is None or predicate(name)}
+                                if filters is None or any(re.fullmatch(pattern, name) for pattern in filters)}
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", UserWarning)
                         with safe_open(paths, "pt", rank,
-                                       process_group=dist.group.WORLD if ranks > 1 and predicate is None else None,
-                                       tensor_filter=predicate,
+                                       process_group=dist.group.WORLD if ranks > 1 and filters is None else None,
+                                       tensor_filter=filters,
                                        backend=Backend[backend], chunk_size=4096, io_depth=8,
                                        concurrency=2 if backend == "MMAP" else 0,
                                        buffer_size=65536, copy=False) as loader:
